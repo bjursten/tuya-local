@@ -5,6 +5,7 @@ API for Tuya Local devices.
 import asyncio
 import logging
 from asyncio.exceptions import CancelledError
+from base64 import b64decode, b64encode
 from threading import Lock
 from time import time
 
@@ -16,6 +17,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.storage import Store
 
 from .const import (
     API_PROTOCOL_VERSIONS,
@@ -29,10 +31,90 @@ from .const import (
     DOMAIN,
 )
 from .helpers.config import get_device_id
-from .helpers.device_config import possible_matches
+from .helpers.device_config import _apply_crc16_modbus, possible_matches
 from .helpers.log import log_json
 
 _LOGGER = logging.getLogger(__name__)
+
+ISC028_DP102_CONFIG = "inkbird_isc028bw_smokercontrol"
+DP102_STORE_VERSION = 1
+DP102_DEFAULT_TARGET_C = 107.2
+DP102_CRC_OFFSET = 90
+# Idle template (°C mode); bytes 0/1/7-8/80/CRC adjusted at runtime.
+_DP102_TEMPLATE_B64 = (
+    "AQAAAAAAAO4HDBcMFwwXDBcMFwAAAAAAAAAAAAAAAAAAAAUFBQUFAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAASSYCAwQZlf8="
+)
+
+
+def _decode_dp102_blob(blob_b64):
+    """Return DP 102 byte fields from a base64 blob."""
+    if not blob_b64:
+        return None
+    try:
+        data = b64decode(blob_b64)
+    except Exception:
+        return None
+    if len(data) < 81:
+        return None
+    return {
+        "fan": data[0],
+        "unit_c": data[1] == 0,
+        "hold_f10": int.from_bytes(data[7:9], "little"),
+        "sound": data[80],
+    }
+
+
+def build_dp102_blob(
+    hold_f10,
+    fan_byte=None,
+    unit_c=True,
+    sound_on=False,
+    base_b64=None,
+):
+    """Build a full DP 102 blob; hold_f10 is always °F×10 (internal format)."""
+    if base_b64:
+        data = bytearray(b64decode(base_b64))
+    else:
+        data = bytearray(b64decode(_DP102_TEMPLATE_B64))
+    if fan_byte is not None:
+        data[0] = fan_byte
+    data[1] = 0 if unit_c else 1
+    data[7:9] = int(hold_f10).to_bytes(2, "little")
+    data[80] = 1 if sound_on else 0
+    data = bytearray(_apply_crc16_modbus(bytes(data), DP102_CRC_OFFSET))
+    return b64encode(bytes(data)).decode()
+
+
+def build_default_dp102_blob():
+    """Default ISC-028-BW settings: fan on, °C, 107.2 °C hold, sound off."""
+    hold_f10 = round((DP102_DEFAULT_TARGET_C * 9 / 5 + 32) * 10)
+    return build_dp102_blob(hold_f10, fan_byte=1, unit_c=True, sound_on=False)
+
+
+def synthesize_dp102_cache_blob(persisted_b64=None, dp101_b64=None):
+    """Build cache-only blob: real hold if known, °C + sound off, fan from DP 101."""
+    hold_f10 = round((DP102_DEFAULT_TARGET_C * 9 / 5 + 32) * 10)
+    fan_byte = 1
+    if persisted_b64:
+        fields = _decode_dp102_blob(persisted_b64)
+        if fields:
+            hold_f10 = fields["hold_f10"]
+            fan_byte = fields["fan"]
+    if dp101_b64:
+        try:
+            raw101 = b64decode(dp101_b64)
+            if len(raw101) >= 11:
+                fan_byte = 1 if raw101[10] > 0 else 0
+        except Exception:
+            pass
+    return build_dp102_blob(
+        hold_f10,
+        fan_byte=fan_byte,
+        unit_c=True,
+        sound_on=False,
+        base_b64=persisted_b64,
+    )
 
 
 def _collect_possible_matches(cached_state, product_ids):
@@ -74,6 +156,15 @@ class TuyaLocalDevice(object):
         self._model = model
         self._children = []
         self._force_dps = []
+        self._config_type = None
+        self._dp102_store = None
+        self._persisted_dp102 = None
+        self._dp102_verified_from_device = False
+        self._dp102_on_101_scheduled = False
+        self._dp102_write_scheduled = False
+        self._fetch_missing_scheduled = False
+        self._dp102_pending_device_write = False
+        self._dp102_session_written = False
         self._product_ids = []
         self._running = False
         self._shutdown_listener = None
@@ -183,6 +274,13 @@ class TuyaLocalDevice(object):
         return info
 
     @property
+    def dp102_persist_enabled(self):
+        return self._config_type == ISC028_DP102_CONFIG
+
+    def set_config_type(self, config_type):
+        self._config_type = config_type
+
+    @property
     def has_returned_state(self):
         """Return True if the device has returned some state."""
         cached = self._get_cached_state()
@@ -232,7 +330,7 @@ class TuyaLocalDevice(object):
 
         self._children.append(entity)
         for dp in entity._config.dps():
-            if dp.force and dp.id not in self._force_dps:
+            if dp.force and int(dp.id) not in self._force_dps:
                 self._force_dps.append(int(dp.id))
 
         if not self._running and not self._startup_listener:
@@ -261,14 +359,16 @@ class TuyaLocalDevice(object):
                         log_json(poll),
                     )
                     full_poll = poll.pop("full_poll", False)
-                    self._cached_state = self._cached_state | poll
+                    poll_dps = self._poll_dps(poll)
+                    self._cached_state = self._cached_state | poll_dps
                     self._cached_state["updated_at"] = time()
-                    self._remove_properties_from_pending_updates(poll)
+                    self._remove_properties_from_pending_updates(poll_dps)
+                    self._handle_dp102_poll(poll_dps)
 
                     for entity in self._children:
                         # let entities trigger off poll contents directly
                         try:
-                            entity.on_receive(poll, full_poll)
+                            entity.on_receive(poll_dps, full_poll)
                         except Exception as e:
                             # Don't let exceptions thrown by the entities interrupt the communication loop
                             # Just log them and move on.
@@ -278,11 +378,8 @@ class TuyaLocalDevice(object):
                                 entity.entity_id,
                                 e,
                             )
-                        # clear non-persistant dps that were not in a full poll
                         if full_poll:
-                            for dp in entity._config.dps():
-                                if not dp.persist and dp.id not in poll:
-                                    self._cached_state.pop(dp.id, None)
+                            self._clear_stale_dps_on_full_poll(poll_dps)
                         entity.schedule_update_ha_state()
                 else:
                     _LOGGER.debug(
@@ -514,10 +611,344 @@ class TuyaLocalDevice(object):
                 lambda: self._refresh_cached_state(),
                 f"Failed to refresh device state for {self.name}.",
             )
+        if self.dp102_persist_enabled:
+            blob = self.get_property("102")
+            if blob:
+                self._dp102_verified_from_device = True
+                self._schedule_persist_dp102(blob)
+
+    def _normalize_dps(self, dps):
+        return {str(key): value for key, value in dps.items()}
+
+    def _poll_dps(self, poll):
+        """String-keyed DP map from a receive-loop poll payload."""
+        if not poll:
+            return {}
+        return self._normalize_dps(
+            {k: v for k, v in poll.items() if str(k) != "full_poll"}
+        )
+
+    def _should_clear_dp_on_full_poll(self, dp_id, poll_dps):
+        if self.dp102_persist_enabled and dp_id == "102":
+            return False
+        return dp_id not in poll_dps
+
+    def _handle_dp102_poll(self, poll_dps):
+        if not self.dp102_persist_enabled:
+            return
+        if "102" in poll_dps:
+            self._dp102_verified_from_device = True
+            self._dp102_pending_device_write = False
+            self._schedule_persist_dp102(poll_dps["102"])
+        elif "101" in poll_dps:
+            self._schedule_dp102_on_101()
+
+    def _clear_stale_dps_on_full_poll(self, poll_dps):
+        for entity in self._children:
+            for dp in entity._config.dps():
+                if not dp.persist and self._should_clear_dp_on_full_poll(
+                    dp.id, poll_dps
+                ):
+                    self._cached_state.pop(dp.id, None)
+
+    def _merge_poll_into_cache(self, poll, full_poll=False):
+        if not poll or "Err" in poll:
+            return False
+        dps = self._normalize_dps(poll.get("dps", {}))
+        if not dps:
+            return False
+        self._cached_state = self._cached_state | dps
+        self._cached_state["updated_at"] = time()
+        self._handle_dp102_poll(dps)
+        if full_poll:
+            self._clear_stale_dps_on_full_poll(dps)
+        for entity in self._children:
+            entity.schedule_update_ha_state()
+        return True
+
+    def _combine_poll_responses(self, *polls):
+        merged = {}
+        for poll in polls:
+            if poll and "Err" not in poll:
+                merged.update(self._normalize_dps(poll.get("dps", {})))
+        return {"dps": merged} if merged else None
+
+    async def _pull_missing_force_dps(self):
+        """Request missing force DPs, then a full status poll."""
+        missing = self._missing_force_dps()
+        if not missing:
+            return None
+        _LOGGER.debug("%s pulling missing dps %s", self.name, missing)
+        upd = await self._retry_on_failed_connection(
+            lambda: self._api.updatedps(missing),
+            f"Failed to update device dps for {self.name}",
+        )
+        stat = await self._retry_on_failed_connection(
+            lambda: self._api.status(),
+            f"Failed to fetch device status for {self.name}",
+        )
+        return self._combine_poll_responses(upd, stat)
+
+    def _missing_force_dps(self):
+        return [
+            dps_id
+            for dps_id in self._force_dps
+            if self.get_property(str(dps_id)) is None
+        ]
+
+    def _schedule_fetch_missing_force_dps(self):
+        if not self._force_dps or not self._missing_force_dps():
+            return
+        if self._fetch_missing_scheduled:
+            return
+        self._fetch_missing_scheduled = True
+        self._hass.async_create_task(self._async_fetch_missing_force_dps())
+
+    async def _async_fetch_missing_force_dps(self):
+        try:
+            for _ in range(12):
+                if not self._missing_force_dps():
+                    return
+                async with self._api_lock:
+                    poll = await self._pull_missing_force_dps()
+                    if poll:
+                        self._merge_poll_into_cache(poll)
+                if not self._missing_force_dps():
+                    _LOGGER.info(
+                        "%s fetched missing force dps",
+                        self.name,
+                    )
+                    return
+                await asyncio.sleep(5)
+            remaining = self._missing_force_dps()
+            if remaining:
+                _LOGGER.warning(
+                    "%s still missing dps after retries: %s",
+                    self.name,
+                    remaining,
+                )
+        finally:
+            self._fetch_missing_scheduled = False
+
+    async def _init_dp102_store(self):
+        if self._dp102_store is not None:
+            return
+        self._dp102_store = Store(
+            self._hass,
+            DP102_STORE_VERSION,
+            f"{DOMAIN}.dp102.{self.unique_id}",
+        )
+        if self._persisted_dp102 is None:
+            stored = await self._dp102_store.async_load() or {}
+            self._persisted_dp102 = stored.get("blob")
+
+    def _schedule_persist_dp102(self, blob):
+        if blob:
+            self._hass.async_create_task(self._async_persist_dp102(blob))
+
+    async def _async_persist_dp102(self, blob):
+        """Save DP 102 blob when it changes (device poll or HA write)."""
+        if not self.dp102_persist_enabled or not blob:
+            return
+        if blob == self._persisted_dp102:
+            return
+        await self._init_dp102_store()
+        self._persisted_dp102 = blob
+        await self._dp102_store.async_save({"blob": blob})
+        _LOGGER.debug("%s persisted DP 102 settings blob", self.name)
+
+    async def async_restore_dp102_to_cache(self):
+        """Restore DP 102 from storage into cache for masked writes."""
+        if not self.dp102_persist_enabled:
+            return False
+        blob = await self.async_load_dp102_cache()
+        return bool(blob)
+
+    def _apply_dp102_to_cache(self, blob, persist=False):
+        if not blob:
+            return None
+        self._cached_state["102"] = blob
+        self._cached_state["updated_at"] = time()
+        for entity in self._children:
+            entity.schedule_update_ha_state()
+        if persist:
+            self._hass.async_create_task(self._async_persist_dp102(blob))
+        return blob
+
+    def _mark_dp102_needs_device_write(self):
+        if not self._dp102_verified_from_device and not self._dp102_session_written:
+            self._dp102_pending_device_write = True
+
+    def _schedule_dp102_on_101(self):
+        """Device is online (101): ensure cache + write if needed."""
+        if not self.dp102_persist_enabled or self._dp102_on_101_scheduled:
+            return
+        self._dp102_on_101_scheduled = True
+        self._hass.async_create_task(self._async_handle_dp102_on_101())
+
+    async def _async_fill_dp102_cache(self):
+        """Build DP 102 cache from storage, device read, or synthesis."""
+        if self._cached_state.get("102"):
+            return True
+        await self._init_dp102_store()
+        if self._persisted_dp102:
+            self._apply_dp102_to_cache(self._persisted_dp102)
+            self._mark_dp102_needs_device_write()
+            _LOGGER.info("%s: restored DP 102 cache from storage", self.name)
+            return True
+        await self.async_fetch_dps([102])
+        if self._cached_state.get("102"):
+            self._dp102_verified_from_device = True
+            await self._async_persist_dp102(self._cached_state["102"])
+            _LOGGER.info("%s: DP 102 read from device for cache", self.name)
+            return True
+        blob = synthesize_dp102_cache_blob(
+            dp101_b64=self.get_property("101"),
+        )
+        self._apply_dp102_to_cache(blob, persist=False)
+        self._mark_dp102_needs_device_write()
+        _LOGGER.info(
+            "%s: synthesized DP 102 cache (hold default, °C, sound off)",
+            self.name,
+        )
+        return True
+
+    async def _async_handle_dp102_on_101(self):
+        """When 101 arrives: fill missing cache, then write once if needed."""
+        try:
+            if not self.dp102_persist_enabled or not self.get_property("101"):
+                return
+            if self._cached_state.get("102") and not self._dp102_pending_device_write:
+                return
+            if not self._cached_state.get("102"):
+                await self._async_fill_dp102_cache()
+            if self._dp102_pending_device_write and self._cached_state.get("102"):
+                await self._async_push_dp102_to_device()
+        finally:
+            self._dp102_on_101_scheduled = False
+
+    def _schedule_dp102_device_write(self):
+        if (
+            not self.dp102_persist_enabled
+            or self._dp102_write_scheduled
+            or not self._dp102_pending_device_write
+            or not self._cached_state.get("102")
+        ):
+            return
+        self._dp102_write_scheduled = True
+        self._hass.async_create_task(self._async_push_dp102_to_device())
+
+    async def _async_push_dp102_to_device(self):
+        """Write cached DP 102 to the device once per session when needed."""
+        try:
+            if (
+                not self.dp102_persist_enabled
+                or not self._dp102_pending_device_write
+            ):
+                return False
+            blob = self._cached_state.get("102")
+            if not blob:
+                return False
+            if not self.get_property("101"):
+                _LOGGER.debug(
+                    "%s: deferring DP 102 write until device reports temps",
+                    self.name,
+                )
+                return False
+            _LOGGER.info("%s: writing DP 102 settings to device", self.name)
+            async with self._api_lock:
+                await self._retry_on_failed_connection(
+                    lambda: self._set_values({"102": blob}),
+                    f"Failed to push DP 102 settings to {self.name}",
+                )
+            if not self._cached_state.get("102"):
+                return False
+            self._dp102_pending_device_write = False
+            self._dp102_session_written = True
+            await self._async_persist_dp102(blob)
+            for entity in self._children:
+                entity.schedule_update_ha_state()
+            _LOGGER.info("%s: DP 102 written to device", self.name)
+            return True
+        finally:
+            self._dp102_write_scheduled = False
+
+    async def async_load_dp102_cache(self):
+        """Populate DP 102 in cache from storage (no device I/O)."""
+        if not self.dp102_persist_enabled:
+            return None
+        try:
+            await self._init_dp102_store()
+        except Exception as err:
+            _LOGGER.warning(
+                "%s: DP 102 storage unavailable, using defaults: %s",
+                self.name,
+                err,
+            )
+        if self._dp102_verified_from_device and self.get_property("102"):
+            return self.get_property("102")
+        if self._persisted_dp102:
+            self._apply_dp102_to_cache(self._persisted_dp102)
+            self._mark_dp102_needs_device_write()
+            return self._cached_state.get("102")
+        blob = synthesize_dp102_cache_blob()
+        self._apply_dp102_to_cache(blob)
+        self._mark_dp102_needs_device_write()
+        return blob
+
+    def seed_dp102_cache_fallback(self):
+        """Synchronous last-resort cache fill when async seed fails (no 101 needed)."""
+        if not self.dp102_persist_enabled:
+            return
+        try:
+            blob = self._persisted_dp102 or build_default_dp102_blob()
+            self._cached_state["102"] = blob
+            self._cached_state["updated_at"] = time()
+            self._mark_dp102_needs_device_write()
+        except Exception as err:
+            _LOGGER.error("%s: could not build DP 102 fallback: %s", self.name, err)
+
+    async def async_seed_dp102(self):
+        """On startup: fill cache from storage; queue one write when device responds."""
+        if not self.dp102_persist_enabled:
+            return True
+
+        await self.async_load_dp102_cache()
+        if self._persisted_dp102:
+            _LOGGER.info("%s: restored DP 102 cache from storage", self.name)
+        elif self._cached_state.get("102"):
+            _LOGGER.info("%s: seeded DP 102 cache (synthesized)", self.name)
+        else:
+            _LOGGER.warning("%s: DP 102 cache seed left cache empty", self.name)
+        return True
+
+    async def async_fetch_dps(self, dps_ids=None):
+        """Fetch DPs from the device without sending a command."""
+        ids = [int(dps_id) for dps_id in (dps_ids or self._force_dps or [])]
+        _LOGGER.debug("Fetching dps %s for %s", ids, self.name)
+        async with self._api_lock:
+            if ids:
+                upd = await self._retry_on_failed_connection(
+                    lambda: self._api.updatedps(ids),
+                    f"Failed to update device dps for {self.name}",
+                )
+                stat = await self._retry_on_failed_connection(
+                    lambda: self._api.status(),
+                    f"Failed to fetch device status for {self.name}",
+                )
+                poll = self._combine_poll_responses(upd, stat)
+                if poll:
+                    self._merge_poll_into_cache(poll)
+            else:
+                await self._retry_on_failed_connection(
+                    lambda: self._refresh_cached_state(),
+                    f"Failed to refresh device state for {self.name}.",
+                )
 
     def get_property(self, dps_id):
         cached_state = self._get_cached_state()
-        return cached_state.get(dps_id)
+        key = str(dps_id)
+        return cached_state.get(key)
 
     async def async_set_property(self, dps_id, value):
         await self.async_set_properties({dps_id: value})
@@ -534,22 +965,29 @@ class TuyaLocalDevice(object):
         self._cached_state[dps_id] = value
 
     def _reset_cached_state(self):
+        dp102_blob = None
+        if self.dp102_persist_enabled:
+            dp102_blob = self._cached_state.get("102") or self._persisted_dp102
         self._cached_state = {"updated_at": 0}
         self._pending_updates = {}
         self._last_connection = 0
         self._last_full_poll = 0
+        if dp102_blob:
+            self._cached_state["102"] = dp102_blob
+            self._cached_state["updated_at"] = time()
+            if not self._dp102_verified_from_device and not self._dp102_session_written:
+                self._dp102_pending_device_write = True
 
     def _refresh_cached_state(self):
         new_state = self._api.status()
         if new_state:
             if "Err" not in new_state:
-                self._cached_state = self._cached_state | new_state.get("dps", {})
+                dps = self._normalize_dps(new_state.get("dps", {}))
+                self._cached_state = self._cached_state | dps
                 self._cached_state["updated_at"] = time()
+                self._handle_dp102_poll(dps)
+                self._clear_stale_dps_on_full_poll(dps)
                 for entity in self._children:
-                    for dp in entity._config.dps():
-                        # Clear non-persistant dps that were not in the poll
-                        if not dp.persist and dp.id not in new_state.get("dps", {}):
-                            self._cached_state.pop(dp.id, None)
                     entity.schedule_update_ha_state()
             elif self._api_working_protocol_failures == 1:
                 _LOGGER.warning(
@@ -634,6 +1072,10 @@ class TuyaLocalDevice(object):
             lambda: self._set_values(pending_properties),
             "Failed to update device state.",
         )
+        if self.dp102_persist_enabled and "102" in pending_properties:
+            self._schedule_persist_dp102(pending_properties["102"])
+            self._dp102_pending_device_write = False
+            self._dp102_session_written = True
 
     def _set_values(self, properties):
         try:

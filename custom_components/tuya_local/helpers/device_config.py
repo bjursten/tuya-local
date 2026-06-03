@@ -582,7 +582,18 @@ class TuyaDpsConfig:
             raise TypeError(f"{self.name} is read only")
         if self.invalid_for(value, device):
             raise AttributeError(f"{self.name} cannot be set at this time")
-        settings = self.get_values_to_set(device, value)
+        try:
+            settings = self.get_values_to_set(device, value)
+        except ValueError as err:
+            if str(err) != "Cannot mask unknown current value":
+                raise
+            if self.id == "102" and hasattr(device, "async_restore_dp102_to_cache"):
+                restored = await device.async_restore_dp102_to_cache()
+                if not restored:
+                    await device.async_fetch_dps([int(self.id)])
+            else:
+                await device.async_fetch_dps([int(self.id)])
+            settings = self.get_values_to_set(device, value)
         await device.async_set_properties(settings)
 
     def mapping_available(self, mapping, device):

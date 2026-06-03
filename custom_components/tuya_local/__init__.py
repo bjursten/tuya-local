@@ -972,13 +972,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     config = {**entry.data, **entry.options, "name": entry.title}
     try:
         device = await hass.async_add_executor_job(setup_device, hass, config)
-        await device.async_refresh()
+        device.set_config_type(config[CONF_TYPE])
+        if device.dp102_persist_enabled:
+            try:
+                await device.async_seed_dp102()
+            except Exception as err:
+                _LOGGER.warning(
+                    "%s: DP 102 cache seed failed, using defaults: %s",
+                    device.name,
+                    err,
+                )
+                device.seed_dp102_cache_fallback()
+        else:
+            await device.async_refresh()
 
     except Exception as e:
         cleanup_failed_device(hass, device_id)
         raise ConfigEntryNotReady("tuya-local device not ready") from e
 
-    if not device.has_returned_state:
+    if device.dp102_persist_enabled:
+        if not device._cached_state.get("102"):
+            device.seed_dp102_cache_fallback()
+    elif not device.has_returned_state:
         cleanup_failed_device(hass, device_id)
         raise ConfigEntryNotReady("tuya-local device offline")
 
@@ -996,6 +1011,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     await hass.config_entries.async_forward_entry_setups(entry, entities)
     await async_setup_services(hass, entities)
+    if device.dp102_persist_enabled:
+        if device.get_property("101"):
+            device._schedule_dp102_on_101()
+        else:
+            device._schedule_fetch_missing_force_dps()
 
     entry.add_update_listener(async_update_entry)
 

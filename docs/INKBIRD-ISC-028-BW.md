@@ -75,6 +75,8 @@ Bitmap value **30720** = meat probes 1–4 unplugged, grill probe OK, lid closed
 
 Physical changes on the device (dial, fan button, power cycle) update DP 102 on the unit first; HA picks up hold target on poll when 102 is available or after a successful write from HA.
 
-## Relation to upstream
+## Relation to upstream (make-all/tuya-local)
 
-Upstream contribution (YAML + `crc16_modbus`) may land in make-all/tuya-local separately. The **DP 102 cache layer** in this branch is device-specific and stays here unless upstream adopts a generic equivalent.
+**No active upstream request.** [PR #5232](https://github.com/make-all/tuya-local/pull/5232) was closed in June 2026 — ISC-028-BW support is maintained only on this fork branch (`inkbird-isc028bw`).
+
+Use [make-all/tuya-local](https://github.com/make-all/tuya-local) from HACS for all other devices. Do not expect ISC-028-BW in official releases without the DP 102 cache patches.

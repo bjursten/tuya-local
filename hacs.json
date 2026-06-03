@@ -1,5 +1,5 @@
 {
-    "name": "Tuya Local",
+    "name": "Tuya Local — ISC-028-BW fork (branch inkbird-isc028bw)",
     "homeassistant": "2026.5.0",
     "hacs": "2.0.0"
 }

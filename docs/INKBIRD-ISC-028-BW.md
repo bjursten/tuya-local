@@ -1,10 +1,11 @@
-# Inkbird ISC-028-BW (Tuya Local fork branch)
+# Inkbird ISC-028-BW — special fork branch
+
+> **This is branch `inkbird-isc028bw` on [bjursten/tuya-local](https://github.com/bjursten/tuya-local).**  
+> It is **not** official [make-all/tuya-local](https://github.com/make-all/tuya-local).  
+> Use it **only** for the Inkbird ISC-028-BW smoker (product `8l5th5vqvszbuvlm`).  
+> For all other devices, use upstream Tuya Local from HACS.
 
 Maintained fork branch for the **Inkbird ISC-028-BW** WiFi smoker (`8l5th5vqvszbuvlm`).
-
-**Branch:** [`inkbird-isc028bw`](https://github.com/bjursten/tuya-local/tree/inkbird-isc028bw) on [bjursten/tuya-local](https://github.com/bjursten/tuya-local)
-
-This is **not** the official [make-all/tuya-local](https://github.com/make-all/tuya-local) release. It adds device-specific behaviour required because DP **102** (`setting_para`, 92-byte blob + CRC-16/MODBUS) is needed for climate, fan, and hold target, but the device rarely returns 102 on read.
 
 ## What this branch adds
 

@@ -1,3 +1,16 @@
+> ## ⚠️ Special branch — not official Tuya Local
+>
+> You are on branch **`inkbird-isc028bw`** in [bjursten/tuya-local](https://github.com/bjursten/tuya-local).
+>
+> | Use this branch | Use [make-all/tuya-local](https://github.com/make-all/tuya-local) `main` |
+> |-----------------|---------------------------------------------------------------------------|
+> | **Inkbird ISC-028-BW** smoker only | All other Tuya devices |
+> | Includes DP 102 cache patches | Standard integration, no ISC-028 patches |
+>
+> **Do not** replace your normal HACS Tuya Local install unless you only need ISC-028-BW, or you know you want this fork for all devices.
+>
+> 📄 [ISC-028-BW documentation](docs/INKBIRD-ISC-028-BW.md) · branch [`inkbird-isc028bw`](https://github.com/bjursten/tuya-local/tree/inkbird-isc028bw)
+
 ![logo](custom_components/tuya_local/brand/icon.svg) 
 
 Please report any [issues](https://github.com/make-all/tuya-local/issues) and feel free to raise [pull requests](https://github.com/make-all/tuya-local/pulls).

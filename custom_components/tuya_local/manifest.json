@@ -1,6 +1,6 @@
 {
     "domain": "tuya_local",
-    "name": "Tuya Local (ISC-028-BW fork)",
+    "name": "Inkbird ISC-028-BW (Tuya Local)",
     "codeowners": [
         "@bjursten"
     ],

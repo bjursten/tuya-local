@@ -1,39 +1,38 @@
-# Inkbird ISC-028-BW — special fork branch
+# Inkbird ISC-028-BW — Home Assistant integration
 
-> **This is branch `inkbird-isc028bw` on [bjursten/tuya-local](https://github.com/bjursten/tuya-local).**  
-> It is **not** official [make-all/tuya-local](https://github.com/make-all/tuya-local).  
-> Use it **only** for the Inkbird ISC-028-BW smoker (product `8l5th5vqvszbuvlm`).  
-> For all other devices, use upstream Tuya Local from HACS.
+Local control for the **Inkbird ISC-028-BW** WiFi BBQ smoker (`8l5th5vqvszbuvlm`, Tuya protocol **3.5**) in Home Assistant via a maintained branch of [Tuya Local](https://github.com/make-all/tuya-local).
 
-Maintained fork branch for the **Inkbird ISC-028-BW** WiFi smoker (`8l5th5vqvszbuvlm`).
+**Repository:** [bjursten/tuya-local](https://github.com/bjursten/tuya-local) · **Branch:** `inkbird-isc028bw` · **Overview:** [README.md](../README.md)
 
-## What this branch adds
+## Problem and solution
+
+**Problem:** Settings are stored in DP **102** (`setting_para`, 92 bytes, CRC-16/Modbus). The smoker almost never returns 102 on read. Standard Tuya Local can show temperatures from DP **101** but masked writes to 102 fail without a cached blob (*Cannot mask unknown current value*). Climate target, unit, sound, and start/stop do not work reliably.
+
+**Solution on this branch:**
 
 | Change | Purpose |
 |--------|---------|
 | `inkbird_isc028bw_smokercontrol.yaml` | Device config (temps, climate, smoker switch, alarms) |
 | `crc16_modbus` in `device_config.py` | Correct CRC on masked DP 102 writes |
-| DP 102 cache in `device.py` / `__init__.py` | Seed cache at startup (storage or default), fill on poll 101, one controlled write per session |
-
-Without the Python patches, entities may show temperatures from DP 101 but climate target, unit, sound, and start/stop fail with *Cannot mask unknown current value*.
+| DP 102 cache in `device.py` / `__init__.py` | Seed cache at startup (storage or default), update when 101 is polled, protect 102 on full poll cleanup |
 
 ## Install (full integration)
 
-Use this branch **instead of** the standard HACS Tuya Local package for the ISC-028-BW device:
+Use this branch when ISC-028-BW is your only Tuya Local device, or you accept one custom integration install:
 
 1. HACS → Integrations → ⋮ → Custom repositories  
    - Repository: `https://github.com/bjursten/tuya-local`  
    - Category: Integration  
-2. Install **Tuya Local** from that repository (or redownload if already installed from make-all).  
-3. Select branch **`inkbird-isc028bw`** if HACS allows branch selection; otherwise clone/checkout that branch under `custom_components/tuya_local`.  
+2. Install **Inkbird ISC-028-BW (Tuya Local)** from that repository (redownload if you previously used make-all).  
+3. Branch **`inkbird-isc028bw`** (HACS branch selection, or checkout under `custom_components/tuya_local`).  
 4. Restart Home Assistant.  
-5. Add the device in Tuya Local with protocol **3.5** (same local key / IP as any Tuya Local setup).
+5. Add the device with protocol **3.5**.
 
 **One local client only** — disable LocalTuya (or other local Tuya clients) for this device.
 
 ## Install (minimal patch, HACS base unchanged)
 
-If you keep official Tuya Local from HACS, copy only the patched files from the companion repo or this branch:
+Keep official [make-all/tuya-local](https://github.com/make-all/tuya-local) from HACS and copy only:
 
 - `custom_components/tuya_local/devices/inkbird_isc028bw_smokercontrol.yaml`
 - `custom_components/tuya_local/device.py`
@@ -41,6 +40,8 @@ If you keep official Tuya Local from HACS, copy only the patched files from the 
 - `custom_components/tuya_local/helpers/device_config.py`
 
 Restart Home Assistant after Python changes (reload integration is not enough).
+
+The companion experiment repo includes `scripts/deploy-to-ha.sh` for the same four files plus YAML.
 
 ## Entities (summary)
 
@@ -77,6 +78,4 @@ Physical changes on the device (dial, fan button, power cycle) update DP 102 on 
 
 ## Relation to upstream (make-all/tuya-local)
 
-**No active upstream request.** [PR #5232](https://github.com/make-all/tuya-local/pull/5232) was closed in June 2026 — ISC-028-BW support is maintained only on this fork branch (`inkbird-isc028bw`).
-
-Use [make-all/tuya-local](https://github.com/make-all/tuya-local) from HACS for all other devices. Do not expect ISC-028-BW in official releases without the DP 102 cache patches.
+ISC-028-BW support is maintained on branch `inkbird-isc028bw` only. [PR #5232](https://github.com/make-all/tuya-local/pull/5232) was closed in June 2026. Use [make-all/tuya-local](https://github.com/make-all/tuya-local) from HACS for all other devices.
